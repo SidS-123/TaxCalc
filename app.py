@@ -1,215 +1,362 @@
-﻿import streamlit as st
+﻿# app.py
+import streamlit as st
 import pandas as pd
-import re
+import io
+import matplotlib.pyplot as plt
+from typing import Dict, Any
 
-# ------------------ Tax Config (easily editable each year) ------------------
-TAX_RATES = {
-    "ss_rate": 0.062,
-    "ss_wage_limit": 168600,         # 2025 limit
-    "medicare_rate": 0.0145,
-    "addl_medicare_rate": 0.009,
-    "addl_medicare_threshold": 200000,
-    "fed_est_rate": 0.12,            # simple placeholder for demo
-    "dep_care_limit": 5000,
-    "401k_limit": 23000,
+# ---------------------------
+# COLUMN MAPPING (CSV header -> internal field)
+# ---------------------------
+COLUMN_MAP = {
+    # Identification / metadata
+    "profile_id": "profile_id",
+    "year": "year",
+    "employer_name": "employer_name",
+    "employer_id": "employer_id",
+    "employee_name": "employee_name",
+    "ssn": "ssn",
+    "state": "state",
+    "locality_name": "locality_name",
+
+    # Core wage fields
+    "wages": "wages",
+    "taxable_wages": "taxable_wages",
+
+    # Federal withholding
+    "federal_income_tax_withheld": "federal_withheld",
+
+    # Social Security
+    "social_security_wages": "ss_wages",
+    "social_security_tax_withheld": "ss_withheld",
+
+    # Medicare
+    "medicare_wages": "med_wages",
+    "medicare_tax_withheld": "med_withheld",
+
+    # State & Local
+    "state_wages": "state_wages",
+    "state_tax_withheld": "state_tax",
+    "local_wages": "local_wages",
+    "local_tax_withheld": "local_tax",
+
+    # Benefits (pretax contributions)
+    "retirement_deferrals": "retirement_deferrals",         # 401k/403b/457
+    "dependent_care_benefits": "dependent_care_benefits",   # DCB
 }
 
-# ------------------ Streamlit Layout ------------------
-st.set_page_config(page_title="TaxAI - W-2 Calculator", layout="wide")
-st.title("ðŸ§¾ TaxAI: W-2 Tax Info Calculator (2025 Edition)")
+# ---------------------------
+# Tax tables (multi-year support)
+# ---------------------------
+IRS_BRACKETS = {
+    2024: [
+        (0, 11600, 0.10),
+        (11600, 47150, 0.12),
+        (47150, 100525, 0.22),
+        (100525, 191950, 0.24),
+        (191950, 243725, 0.32),
+        (243725, 609350, 0.35),
+        (609350, float("inf"), 0.37),
+    ],
+    2023: [
+        (0, 11000, 0.10),
+        (11000, 44725, 0.12),
+        (44725, 95375, 0.22),
+        (95375, 182100, 0.24),
+        (182100, 231250, 0.32),
+        (231250, 578125, 0.35),
+        (578125, float("inf"), 0.37),
+    ],
+    2022: [
+        (0, 10275, 0.10),
+        (10275, 41775, 0.12),
+        (41775, 89075, 0.22),
+        (89075, 170050, 0.24),
+        (170050, 215950, 0.32),
+        (215950, 539900, 0.35),
+        (539900, float("inf"), 0.37),
+    ],
+    2021: [
+        (0, 9950, 0.10),
+        (9950, 40525, 0.12),
+        (40525, 86375, 0.22),
+        (86375, 164925, 0.24),
+        (164925, 209425, 0.32),
+        (209425, 523600, 0.35),
+        (523600, float("inf"), 0.37),
+    ],
+    2025: [  # placeholder
+        (0, 12000, 0.10),
+        (12000, 49000, 0.12),
+        (49000, 105000, 0.22),
+        (105000, 200000, 0.24),
+        (200000, 270000, 0.32),
+        (270000, 630000, 0.35),
+        (630000, float("inf"), 0.37),
+    ],
+}
 
-st.markdown("""
-Upload a **W-2 CSV file** â€” the app will automatically detect column names, 
-compute derived federal, Social Security, and Medicare tax data, and 
-apply current-year IRS rates.
-""")
+STANDARD_DEDUCTION = {
+    2024: {"single": 14600, "married": 29200, "hoh": 21900},
+    2023: {"single": 13850, "married": 27700, "hoh": 20700},
+    2022: {"single": 12950, "married": 25900, "hoh": 19400},
+    2021: {"single": 12550, "married": 25100, "hoh": 18800},
+    2025: {"single": 15750, "married": 31500, "hoh": 23625},
+}
 
-uploaded_file = st.file_uploader("ðŸ“‚ Upload W-2 CSV", type=["csv"])
+SS_WAGE_BASE = {2021: 142800, 2022: 147000, 2023: 160200, 2024: 168600, 2025: 176100}
+SS_RATE = 0.062
+MEDICARE_RATE = 0.0145
+ADDITIONAL_MEDICARE_RATE = 0.009
+ADDITIONAL_MEDICARE_THRESHOLDS = {
+    "single": 200000,
+    "married": 250000,
+    "married_separate": 125000,
+    "hoh": 200000,
+}
 
-# ------------------ Helper Functions ------------------
-def find_col(df, patterns):
-    """Fuzzy find a column in df using a list of regex patterns."""
-    for pattern in patterns:
-        for col in df.columns:
-            if re.search(pattern, col, re.IGNORECASE):
-                return col
-    return None
-
-
-def get(df, mappings, key):
-    """Safely return df[column] or 0 if not found."""
-    colname = mappings.get(key)
-    return df[colname] if colname and colname in df.columns else 0
-
-
-# ------------------ Main Logic ------------------
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    # normalize headers to avoid invisible mismatches (BOMs, whitespace)
-    df.columns = [str(c).strip().replace('\ufeff', '') for c in df.columns]
-    st.subheader("ðŸ“‹ Raw W-2 Data")
-    ### CANONICAL_W2_FIELDS_INSERTED
-    # Normalize and ensure canonical W-2 fields (added by automation)
+# ---------------------------
+# Utilities
+# ---------------------------
+def to_number(x) -> float:
+    """Attempt to convert common numeric strings to float. Return 0.0 on failure."""
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+    # remove $ and commas and parentheses
+    s = s.replace("$", "").replace(",", "").replace("(", "-").replace(")", "")
     try:
-        required_cols = ['year','employer_name','employer_id','employee_name','ssn','wages','taxable_wages','federal_income_tax_withheld','social_security_wages','social_security_tax_withheld','medicare_wages','medicare_tax_withheld','retirement_deferrals','dependent_care_benefits','state','state_wages','state_tax_withheld','local_wages','local_tax_withheld','locality_name','net_pay','social_security_tax_rate','medicare_tax_rate']
-        # normalize column names to lower-case strings
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        num_cols = ['year','wages','taxable_wages','federal_income_tax_withheld','social_security_wages','social_security_tax_withheld','medicare_wages','medicare_tax_withheld','retirement_deferrals','dependent_care_benefits','state_wages','state_tax_withheld','local_wages','local_tax_withheld','net_pay','social_security_tax_rate','medicare_tax_rate']
-        for c in required_cols:
-            if c not in df.columns:
-                if c in num_cols:
-                    df[c] = 0
-                else:
-                    df[c] = ''
-        # coerce numeric-like columns to numeric safely
-        for c in num_cols:
-            try:
-                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-            except Exception:
-                pass
+        return float(s)
     except Exception:
-        # leave df unchanged on unexpected errors
-        pass
+        return 0.0
 
-    st.dataframe(df, use_container_width=True)
 
-    # --- Flexible column mapping ---
-    mappings = {
-        "Employee": find_col(df, [r"employee", r"name"]),
-        # employer and identity fields
-        "EmployerName": find_col(df, [r"employer", r"company", r"employer_name"]),
-        "EmployerID": find_col(df, [r"ein", r"employer.*id", r"employer_id"]),
-        "SSN": find_col(df, [r"\bssn\b", r"social.*security", r"ssn"]),
-        "Box1_Wages": find_col(df, [r"box\s*1", r"wages", r"wage\s*income"]),
-        "Box2_FedWithheld": find_col(df, [r"box\s*2", r"federal.*withheld", r"fed.*tax"]),
-        "Box3_SSWages": find_col(df, [r"box\s*3", r"ss.*wages", r"social.*security.*wages"]),
-        "Box4_SSTaxWithheld": find_col(df, [r"box\s*4", r"ss.*tax.*withheld", r"social.*security.*tax"]),
-        "Box5_MedicareWages": find_col(df, [r"box\s*5", r"medicare.*wages"]),
-        # Medicare withheld can be labeled in many ways; try a wide set of patterns
-        "Box6_MedicareWithheld": find_col(
-            df,
-            [
-                r"box\s*6",
-                r"medicare.*withheld",
-                r"medicare.*tax",
-                r"medicaretax",
-                r"medicarewithheld",
-                r"medicare",
-            ],
-        ),
-        "Box10_DependentCare": find_col(df, [r"box\s*10", r"dependent.*care"]),
-        "Box12_CodeD": find_col(df, [r"box\s*12", r"401k", r"retirement"]),
-        "Box16_StateWages": find_col(df, [r"box\s*16", r"state.*wages"]),
-        "Box17_StateWithheld": find_col(df, [r"box\s*17", r"state.*tax.*withheld"]),
-        # local tax fields often appear in boxes 18-20 or labelled local
-        "Box18_LocalWages": find_col(df, [r"box\s*18", r"local.*wages"]),
-        "Box19_LocalWithheld": find_col(df, [r"box\s*19", r"local.*tax.*withheld", r"local.*withheld"]),
-        "Box20_LocalityName": find_col(df, [r"box\s*20", r"locality", r"locality_name"]),
-        "Year": find_col(df, [r"year", r"tax\s*year"]),
-    }
+def normalize_row_for_internal(row: pd.Series) -> Dict[str, Any]:
+    """
+    Build an internal dict keyed by internal names using COLUMN_MAP.
+    Non-mapped columns are left accessible via 'extra_*' keys.
+    """
+    normalized = {}
+    # map known CSV headers
+    for csv_key, internal_key in COLUMN_MAP.items():
+        # allow case-insensitive match of headers
+        matched_val = None
+        for candidate in (csv_key, csv_key.upper(), csv_key.lower(), csv_key.title()):
+            if candidate in row.index:
+                matched_val = row[candidate]
+                break
+        if matched_val is None and csv_key in row.index:
+            matched_val = row[csv_key]
+        # convert to numeric where appropriate
+        if matched_val is None:
+            normalized[internal_key] = 0.0
+        else:
+            # for SSN or textual fields we keep as string if non-numeric
+            if internal_key in ("employee_name", "employer_name", "ssn", "employer_id", "profile_id", "locality_name", "state"):
+                normalized[internal_key] = matched_val
+            else:
+                normalized[internal_key] = to_number(matched_val)
 
-    missing = [k for k, v in mappings.items() if v is None]
-    if missing:
-        st.warning(f"âš ï¸ Missing or unrecognized columns for: {', '.join(missing)}")
+    # carry-through any other raw fields as extra_*
+    for col in row.index:
+        if col not in COLUMN_MAP:
+            normalized[f"extra_{col}"] = row[col]
 
-    # --- Core Calculations ---
-    df_result = pd.DataFrame()
-    df_result["Employee"] = get(df, mappings, "Employee")
-    df_result["Total_Fed_Income"] = get(df, mappings, "Box1_Wages")
-    df_result["Total_Fed_Withheld"] = get(df, mappings, "Box2_FedWithheld")
+    return normalized
 
-    # Social Security (cap at wage limit)
-    ss_wages = get(df, mappings, "Box3_SSWages").clip(upper=TAX_RATES["ss_wage_limit"])
-    df_result["Expected_SS_Tax"] = ss_wages * TAX_RATES["ss_rate"]
-    df_result["SS_Tax_Diff"] = get(df, mappings, "Box4_SSTaxWithheld") - df_result["Expected_SS_Tax"]
+# ---------------------------
+# Data model classes
+# ---------------------------
+class W2Record:
+    def __init__(self, data: Dict[str, Any]):
+        """
+        Accepts a dict containing internal field names (as produced by normalize_row_for_internal).
+        """
+        self.raw = data
+        # string / id fields
+        self.profile_id = data.get("profile_id", "")
+        self.year = int(to_number(data.get("year", 0))) if data.get("year", "") != "" else None
+        self.employer_name = data.get("employer_name", "")
+        self.employer_id = data.get("employer_id", "")
+        self.employee_name = data.get("employee_name", "") or data.get("EmployeeName", "")
+        self.ssn = data.get("ssn", "")
+        self.locality_name = data.get("locality_name", "")
+        self.state = data.get("state", "")
 
-    # Medicare base tax
-    medicare_wages = get(df, mappings, "Box5_MedicareWages")
-    df_result["Expected_Medicare_Tax"] = medicare_wages * TAX_RATES["medicare_rate"]
+        # numeric wage + tax fields
+        self.wages = to_number(data.get("wages", 0.0))
+        self.taxable_wages = to_number(data.get("taxable_wages", 0.0))
+        self.federal_withheld = to_number(data.get("federal_withheld", 0.0))
+        self.ss_wages = to_number(data.get("ss_wages", 0.0))
+        self.ss_withheld = to_number(data.get("ss_withheld", 0.0))
+        self.med_wages = to_number(data.get("med_wages", 0.0))
+        self.med_withheld = to_number(data.get("med_withheld", 0.0))
+        self.state_wages = to_number(data.get("state_wages", 0.0))
+        self.state_tax = to_number(data.get("state_tax", 0.0))
+        self.local_wages = to_number(data.get("local_wages", 0.0))
+        self.local_tax = to_number(data.get("local_tax", 0.0))
 
-    # Additional Medicare (over threshold)
-    df_result["Additional_Medicare_Tax"] = (
-        (medicare_wages - TAX_RATES["addl_medicare_threshold"]).clip(lower=0)
-        * TAX_RATES["addl_medicare_rate"]
-    )
+        # benefits
+        self.retirement_deferrals = to_number(data.get("retirement_deferrals", 0.0))
+        self.dependent_care_benefits = to_number(data.get("dependent_care_benefits", 0.0))
 
-    df_result["Total_Medicare_Tax_Liability"] = (
-        df_result["Expected_Medicare_Tax"] + df_result["Additional_Medicare_Tax"]
-    )
-    df_result["Medicare_Tax_Diff"] = get(df, mappings, "Box6_MedicareWithheld") - df_result["Total_Medicare_Tax_Liability"]
+        # derived/metadata defaults
+        self.filing_status = data.get("filing_status", data.get("filingStatus", "single")).lower()
 
-    # 401(k) and Dependent Care
-    df_result["Retirement_Contrib_401k"] = get(df, mappings, "Box12_CodeD")
-    df_result["Over_401k_Limit"] = df_result["Retirement_Contrib_401k"] > TAX_RATES["401k_limit"]
-    df_result["Dependent_Care_Benefit"] = get(df, mappings, "Box10_DependentCare")
-    df_result["Dep_Care_Over_Limit"] = df_result["Dependent_Care_Benefit"] > TAX_RATES["dep_care_limit"]
+# ---------------------------
+# Federal tax engine
+# ---------------------------
+class IRSFederalTaxCalculator:
+    def __init__(self, taxable_income: float, year: int = 2024, filing_status: str = "single"):
+        self.income = max(0.0, float(taxable_income))
+        self.year = year if year in IRS_BRACKETS else 2024
+        self.filing_status = filing_status if filing_status in STANDARD_DEDUCTION[self.year] else "single"
+        self.brackets = IRS_BRACKETS[self.year]
+        self.standard_deduction = STANDARD_DEDUCTION[self.year][self.filing_status]
 
-    # State
-    df_result["State_Taxable_Income"] = get(df, mappings, "Box16_StateWages")
-    df_result["State_Tax_Withheld"] = get(df, mappings, "Box17_StateWithheld")
+    def compute_federal_tax(self):
+        taxable_after_std = max(0.0, self.income - self.standard_deduction)
+        tax = 0.0
+        for lower, upper, rate in self.brackets:
+            if taxable_after_std > lower:
+                taxed_amount = min(taxable_after_std, upper) - lower
+                if taxed_amount > 0:
+                    tax += taxed_amount * rate
+            else:
+                break
+        return tax, taxable_after_std
 
-    # Simple refund/owed estimate (rough)
-    df_result["Estimated_Fed_Liability"] = get(df, mappings, "Box1_Wages") * TAX_RATES["fed_est_rate"]
-    df_result["Potential_Refund_or_Owed"] = (
-        get(df, mappings, "Box2_FedWithheld") - df_result["Estimated_Fed_Liability"]
-    )
+# ---------------------------
+# Derived fields calculator
+# ---------------------------
+class W2DerivedCalculator:
+    def __init__(self, rec: W2Record, tax_year: int = 2024):
+        self.r = rec
+        self.tax_year = tax_year
+        self.ss_wage_cap = SS_WAGE_BASE.get(tax_year, SS_WAGE_BASE[2024])
 
-    # --- Display Results ---
-    st.subheader("ðŸ“Š Derived Tax Calculations (2025 Rates)")
-    # Render boolean-like columns as explicit 'true' / 'false' strings
-    df_display = df_result.copy()
-    # Sanitize display DataFrame: avoid showing literal None/"None"/"NONE" in the UI
-    try:
-        df_display = df_display.fillna("")
-        df_display = df_display.replace({None: "", "None": "", "NONE": ""})
-    except Exception:
-        pass
-    def is_bool_like(s: pd.Series) -> bool:
-        # True if dtype is boolean or values are only boolean-like (0/1/true/false/yes/no)
-        if pd.api.types.is_bool_dtype(s):
-            return True
-        vals = s.dropna().unique()
-        if len(vals) == 0:
-            return False
-        lowered = {str(v).strip().lower() for v in vals}
-        bool_like_set = {"true", "false", "1", "0", "yes", "no", "y", "n"}
-        return lowered.issubset(bool_like_set)
+    def compute_all(self) -> Dict[str, Any]:
+        r = self.r
+        derived = {}
 
-    for c in df_display.columns:
-        try:
-            if is_bool_like(df_display[c]):
-                df_display[c] = df_display[c].apply(lambda v: 'true' if str(v).strip().lower() in ('true', '1', 'yes', 'y') else 'false')
-        except Exception:
-            # if any unexpected error, skip conversion for that column
-            pass
+        # identity
+        derived["Employee"] = r.employee_name or r.profile_id or "Unknown"
 
-    st.dataframe(df_display, use_container_width=True)
+        # basic
+        derived["Annual Taxable Income (Box 1 / wages)"] = r.wages
+        derived["Taxable Wages (taxable_wages)"] = r.taxable_wages
 
-    # --- Human-readable list of derived calculations ---
-    st.markdown("### Derived fields explained")
-    derived_descriptions = {
-        "Expected_SS_Tax": "Social Security tax expected = min(SS wages, wage limit) Ã— 6.2%",
-        "SS_Tax_Diff": "Difference between reported Social Security tax withheld and expected SS tax",
-        "Expected_Medicare_Tax": "Medicare tax expected = Medicare wages Ã— 1.45%",
-        "Additional_Medicare_Tax": "Additional Medicare tax on wages above threshold (0.9% over $200,000)",
-        "Total_Medicare_Tax_Liability": "Sum of expected Medicare tax + additional Medicare tax",
-        "Medicare_Tax_Diff": "Difference between reported Medicare tax withheld and total Medicare liability",
-        "Retirement_Contrib_401k": "Reported 401(k) contributions (Box 12 code D if present)",
-        "Over_401k_Limit": "Boolean: contribution exceeds the annual 401(k) limit",
-        "Dependent_Care_Benefit": "Reported dependent care benefits (Box 10)",
-        "Dep_Care_Over_Limit": "Boolean: dependent care benefit exceeds the annual limit",
-        "Estimated_Fed_Liability": "Simple estimated federal liability used for a rough refund estimate (placeholder rate)",
-        "Potential_Refund_or_Owed": "Approximate difference: federal tax withheld âˆ’ estimated federal liability",
-    }
+        # gross estimation
+        gross_est = max(r.wages, r.ss_wages, r.med_wages, r.taxable_wages)
+        derived["Total Gross Earnings (estimate)"] = gross_est
 
-    # Render as a neat markdown table
-    md_lines = ["| Field | Description |", "|---|---|"]
-    for k, v in derived_descriptions.items():
-        md_lines.append(f"| `{k}` | {v} |")
-    st.markdown("\n".join(md_lines))
+        # pretax inference
+        derived["Inferred Pretax Reductions"] = gross_est - r.wages
 
-    # --- Produce final CSV with requested schema ---
-    out_cols = [
+        # Social Security
+        ss_owed = SS_RATE * min(r.ss_wages, self.ss_wage_cap)
+        derived["Social Security Tax Owed (expected)"] = ss_owed
+        derived["Social Security Tax Withheld (Box 4)"] = r.ss_withheld
+        derived["SS Withheld - Expected"] = r.ss_withheld - ss_owed
+        derived["SS Wage Cap"] = self.ss_wage_cap
+        derived["SS Wage Cap Exceeded"] = r.ss_wages > self.ss_wage_cap
+
+        # Medicare
+        med_basic = MEDICARE_RATE * r.med_wages
+        threshold = ADDITIONAL_MEDICARE_THRESHOLDS.get(r.filing_status, ADDITIONAL_MEDICARE_THRESHOLDS["single"])
+        extra_med = 0.0
+        if r.med_wages > threshold:
+            extra_med = (r.med_wages - threshold) * ADDITIONAL_MEDICARE_RATE
+        med_total = med_basic + extra_med
+        derived["Medicare Tax Owed (expected)"] = med_total
+        derived["Medicare Tax Withheld (Box 6)"] = r.med_withheld
+        derived["Medicare Withheld - Expected"] = r.med_withheld - med_total
+        derived["Additional Medicare Threshold (filing status)"] = threshold
+
+        # payroll totals & rates
+        derived["Federal Tax Withheld (Box 2)"] = r.federal_withheld
+        derived["Total Payroll Taxes Withheld (Fed+SS+Med)"] = r.federal_withheld + r.ss_withheld + r.med_withheld
+        derived["Federal Withholding Rate (Box2/Box1)"] = (r.federal_withheld / r.wages) if r.wages else 0.0
+        derived["State Tax Withheld"] = r.state_tax
+        derived["Local Tax Withheld"] = r.local_tax
+
+        # benefits
+        derived["Retirement Deferrals (reported)"] = r.retirement_deferrals
+        derived["Dependent Care Benefits (Box10)"] = r.dependent_care_benefits
+
+        # EITC-like metric
+        derived["Earned Income Metric (wages + imputed)"] = r.wages + 0.0  # imputed income not present in this CSV
+
+        # error detection
+        errors = []
+        # negative checks
+        numeric_fields = ["wages", "taxable_wages", "federal_withheld", "ss_wages", "ss_withheld", "med_wages", "med_withheld"]
+        for f in numeric_fields:
+            val = getattr(r, f, 0.0)
+            if val < 0:
+                errors.append(f"Negative value detected in {f}: {val}")
+
+        if abs(r.ss_withheld - ss_owed) > 1.0:
+            errors.append(f"SS withheld ({r.ss_withheld}) differs from expected ({ss_owed:.2f})")
+
+        if abs(r.med_withheld - med_total) > 1.0:
+            errors.append(f"Medicare withheld ({r.med_withheld}) differs from expected ({med_total:.2f})")
+
+        # Box rule check
+        if not (r.wages <= r.ss_wages + 1e-9 or r.wages <= r.med_wages + 1e-9):
+            errors.append("Wages (Box1) exceed SS/Medicare wages (unusual)")
+
+        derived["Detected Errors/Warnings"] = errors
+
+        # federal tax via bracket engine
+        fed_calc = IRSFederalTaxCalculator(r.wages, year=self.tax_year, filing_status=r.filing_status)
+        fed_tax, taxable_after_std = fed_calc.compute_federal_tax()
+        derived["Taxable Income After Standard Deduction"] = taxable_after_std
+        derived["Federal Tax (computed via brackets)"] = fed_tax
+        derived["Federal Refund / (Balance Due)"] = r.federal_withheld - fed_tax
+
+        # consistency score
+        score = 1.0
+        if errors:
+            score -= 0.2 * min(len(errors), 4)
+        if r.ss_wages > self.ss_wage_cap:
+            score -= 0.1
+        derived["Consistency Score (0-1)"] = max(0.0, score)
+
+        return derived
+
+# ---------------------------
+# Streamlit UI (Single Page)
+# ---------------------------
+st.set_page_config(page_title="W-2 Dashboard (Single Page)", layout="wide")
+st.title("📄 W-2 Derived Fields Dashboard — Single Page")
+
+st.markdown("Upload a CSV with W-2 rows (headers matched to your provided format). Select a tax year (default 2024).")
+
+col1, col2 = st.columns([3, 1])
+with col1:
+    uploaded = st.file_uploader("Upload W-2 CSV", type=["csv"])
+with col2:
+    tax_year = st.selectbox("IRS Tax Year", options=[2024, 2023, 2022, 2021, 2025], index=0)
+    default_filing = st.selectbox("Default filing status", options=["single", "married", "hoh", "married_separate"], index=0)
+
+if uploaded:
+    df_raw = pd.read_csv(uploaded, dtype=str)  # read as strings to preserve formatting for parsing
+    st.success(f"Loaded {len(df_raw)} rows from CSV")
+
+    # Show parsed header preview
+    with st.expander("CSV headers (preview)"):
+        st.write(list(df_raw.columns))
+
+    derived_rows = []
+    info_rows = []
+    # Keys to include in the 'Info' export (preserve original input/source fields)
+    info_keys = [
+        "profile_id",
         "year",
         "employer_name",
         "employer_id",
@@ -217,155 +364,154 @@ if uploaded_file:
         "ssn",
         "wages",
         "taxable_wages",
-        "federal_income_tax_withheld",
-        "social_security_wages",
-        "social_security_tax_withheld",
-        "medicare_wages",
-        "medicare_tax_withheld",
-        "retirement_deferrals",
-    "dependent_care_benefits",
         "state",
+        "locality_name",
         "state_wages",
         "state_tax_withheld",
         "local_wages",
         "local_tax_withheld",
-        "locality_name",
-        "net_pay",
-        "social_security_tax_rate",
-        "medicare_tax_rate",
-        # include some derived fields so the export contains the calculated tax checks
-        "Total_Fed_Income",
-        "Total_Fed_Withheld",
-        "Expected_SS_Tax",
-        "SS_Tax_Diff",
-        "Expected_Medicare_Tax",
-        "Additional_Medicare_Tax",
-        "Total_Medicare_Tax_Liability",
-        "Medicare_Tax_Diff",
-        "Retirement_Contrib_401k",
     ]
+    for idx, row in df_raw.iterrows():
+        normalized = normalize_row_for_internal(row)
+        # ensure filing status
+        if not normalized.get("filing_status"):
+            normalized["filing_status"] = default_filing
+        rec = W2Record(normalized)
+        calc = W2DerivedCalculator(rec, tax_year=tax_year)
+        derived = calc.compute_all()
+        # capture original/input info fields for separate export/display
+        info = {k: normalized.get(k) for k in info_keys}
+        info_rows.append(info)
+        derived_rows.append(derived)
 
-    # helper to safely pull series or scalar
-    def pull(col_key, fallback=0):
-        try:
-            return get(df, mappings, col_key)
-        except Exception:
-            return fallback
+    # Display results
+    st.header("Derived Results")
+    for i, d in enumerate(derived_rows):
+        with st.expander(f"{d.get('Employee','Employee')} — Row {i+1}", expanded=(i == 0)):
+            left, right = st.columns([2, 1])
+            with left:
+                st.subheader("Key Summary")
+                summary_keys = [
+                    "Annual Taxable Income (Box 1 / wages)",
+                    "Taxable Wages (taxable_wages)",
+                    "Total Gross Earnings (estimate)",
+                    "Inferred Pretax Reductions",
+                    "Retirement Deferrals (reported)",
+                    "Dependent Care Benefits (Box10)",
+                    "Social Security Tax Owed (expected)",
+                    "Social Security Tax Withheld (Box 4)",
+                    "SS Withheld - Expected",
+                    "Medicare Tax Owed (expected)",
+                    "Medicare Tax Withheld (Box 6)",
+                    "Medicare Withheld - Expected",
+                    "Federal Tax (computed via brackets)",
+                    "Federal Tax Withheld (Box 2)",
+                    "Federal Refund / (Balance Due)",
+                    "Total Payroll Taxes Withheld (Fed+SS+Med)",
+                    "Consistency Score (0-1)",
+                ]
+                for k in summary_keys:
+                    if k in d:
+                        v = d[k]
+                        if isinstance(v, (int, float)):
+                            st.write(f"**{k}:** {v:,.2f}")
+                        else:
+                            st.write(f"**{k}:** {v}")
 
-    final = pd.DataFrame()
-    # prefer pulling values from uploaded CSV when available
-    try:
-        year_val = pd.to_numeric(pull("Year", 2025), errors="coerce")
-        year_val = int(year_val) if pd.notnull(year_val) else 2025
-    except Exception:
-        year_val = 2025
-    final["year"] = year_val
-    final["employer_name"] = pull("EmployerName", "")
-    final["employer_id"] = pull("EmployerID", "")
-    final["employee_name"] = df_result.get("Employee") if "Employee" in df_result else pull("Employee")
-    final["ssn"] = pull("SSN", "")
-    # numeric pulls (coerce to numeric)
-    final["wages"] = pd.to_numeric(df_result.get("Total_Fed_Income") if "Total_Fed_Income" in df_result else pull("Box1_Wages"), errors="coerce")
-    final["taxable_wages"] = final["wages"]
-    final["federal_income_tax_withheld"] = pd.to_numeric(pull("Box2_FedWithheld"), errors="coerce")
-    final["social_security_wages"] = pd.to_numeric(pull("Box3_SSWages"), errors="coerce")
-    final["social_security_tax_withheld"] = pd.to_numeric(pull("Box4_SSTaxWithheld"), errors="coerce")
-    final["medicare_wages"] = pd.to_numeric(pull("Box5_MedicareWages"), errors="coerce")
-    final["medicare_tax_withheld"] = pd.to_numeric(pull("Box6_MedicareWithheld"), errors="coerce")
-    final["retirement_deferrals"] = pd.to_numeric(pull("Box12_CodeD"), errors="coerce")
-    final["dependent_care_benefits"] = pd.to_numeric(pull("Box10_DependentCare"), errors="coerce")
-    final["state"] = ""
-    final["state_wages"] = pd.to_numeric(pull("Box16_StateWages"), errors="coerce")
-    final["state_tax_withheld"] = pd.to_numeric(pull("Box17_StateWithheld"), errors="coerce")
-    # local fields: prefer uploaded values when present
-    final["local_wages"] = pd.to_numeric(pull("Box18_LocalWages", ""), errors="coerce")
-    final["local_tax_withheld"] = pd.to_numeric(pull("Box19_LocalWithheld", ""), errors="coerce")
-    final["locality_name"] = pull("Box20_LocalityName", "")
-    # net_pay = wages - federal - ss - medicare (best-effort)
-    final["net_pay"] = final["wages"] - final["federal_income_tax_withheld"].fillna(0) - final["social_security_tax_withheld"].fillna(0) - final["medicare_tax_withheld"].fillna(0)
-    # Format rate columns as strings with sensible precision so CSV preserves values like 0.062 and 0.0145
-    final["social_security_tax_rate"] = ('{:.4f}'.format(TAX_RATES["ss_rate"]).rstrip('0').rstrip('.'))
-    final["medicare_tax_rate"] = ('{:.4f}'.format(TAX_RATES["medicare_rate"]).rstrip('0').rstrip('.'))
+                st.markdown("---")
+                st.subheader("Other Derived Fields")
+                for k, v in d.items():
+                    if k not in summary_keys and k not in ("Employee", "Detected Errors/Warnings"):
+                        if isinstance(v, (int, float)):
+                            st.write(f"**{k}:** {v:,.2f}")
+                        else:
+                            st.write(f"**{k}:** {v}")
 
-    # Add derived/calculated fields from df_result so the export CSV contains them too
-    try:
-        final["Total_Fed_Income"] = pd.to_numeric(df_result.get("Total_Fed_Income"), errors="coerce")
-        final["Total_Fed_Withheld"] = pd.to_numeric(df_result.get("Total_Fed_Withheld"), errors="coerce")
-        final["Expected_SS_Tax"] = pd.to_numeric(df_result.get("Expected_SS_Tax"), errors="coerce")
-        final["SS_Tax_Diff"] = pd.to_numeric(df_result.get("SS_Tax_Diff"), errors="coerce")
-        final["Expected_Medicare_Tax"] = pd.to_numeric(df_result.get("Expected_Medicare_Tax"), errors="coerce")
-        final["Additional_Medicare_Tax"] = pd.to_numeric(df_result.get("Additional_Medicare_Tax"), errors="coerce")
-        final["Total_Medicare_Tax_Liability"] = pd.to_numeric(df_result.get("Total_Medicare_Tax_Liability"), errors="coerce")
-        final["Medicare_Tax_Diff"] = pd.to_numeric(df_result.get("Medicare_Tax_Diff"), errors="coerce")
-        final["Retirement_Contrib_401k"] = pd.to_numeric(df_result.get("Retirement_Contrib_401k"), errors="coerce")
-    except Exception:
-        # non-fatal: leave missing values if df_result not available
-        pass
+            with right:
+                st.subheader("Errors & Warnings")
+                errs = d.get("Detected Errors/Warnings", [])
+                if errs:
+                    for e in errs:
+                        st.error(e)
+                else:
+                    st.success("No immediate errors detected")
 
-    # Ensure column order
-    final = final[out_cols]
+                # Charts
+                st.subheader("Charts")
+                # Payroll pie
+                fig1, ax1 = plt.subplots()
+                labels = ["Federal", "Social Security", "Medicare", "State", "Local"]
+                vals = [
+                    d.get("Federal Tax Withheld (Box 2)", 0.0) if d.get("Federal Tax Withheld (Box 2)") is not None else d.get("Federal Tax Withheld (Box 2)", d.get("Federal Tax Withheld (Box2)", 0.0)),
+                    d.get("Social Security Tax Withheld (Box 4)", 0.0) if d.get("Social Security Tax Withheld (Box 4)") is not None else d.get("SS Withheld - Expected", 0.0),
+                    d.get("Medicare Tax Withheld (Box 6)", 0.0) if d.get("Medicare Tax Withheld (Box 6)") is not None else d.get("Medicare Withheld - Expected", 0.0),
+                    d.get("State Tax Withheld", 0.0),
+                    d.get("Local Tax Withheld", 0.0),
+                ]
+                if sum(vals) <= 0:
+                    ax1.text(0.5, 0.5, "No payroll withholding data to chart", ha="center", va="center")
+                else:
+                    ax1.pie(vals, labels=labels, autopct="%1.1f%%")
+                ax1.set_title("Payroll Tax Breakdown")
+                st.pyplot(fig1)
 
-    # Sanitize final output more carefully:
-    # - For object/string columns: replace None/'None'/'NONE' with empty string and fill NaNs
-    # - For numeric columns: fill NaNs with 0 so exported CSV contains numeric values instead of blanks
-    try:
-        obj_cols = final.select_dtypes(include=["object"]).columns.tolist()
-        num_cols = final.select_dtypes(include=["number"]).columns.tolist()
-        if obj_cols:
-            final.loc[:, obj_cols] = final.loc[:, obj_cols].fillna("")
-            final.loc[:, obj_cols] = final.loc[:, obj_cols].replace({None: "", "None": "", "NONE": ""})
-        if num_cols:
-            final.loc[:, num_cols] = final.loc[:, num_cols].fillna(0)
-    except Exception:
-        # non-fatal sanitization error; proceed without aborting the app
-        pass
+                # Income allocation bar chart
+                fig2, ax2 = plt.subplots()
+                labels2 = ["Gross", "Taxable After Std Ded", "Payroll Taxes", "Retirement+DCB"]
+                gross = d.get("Total Gross Earnings (estimate)", 0.0)
+                taxable_after = d.get("Taxable Income After Standard Deduction", 0.0)
+                payroll_taxes = d.get("Total Payroll Taxes Withheld (Fed+SS+Med)", 0.0)
+                retirement = d.get("Retirement Deferrals (reported)", 0.0) + d.get("Dependent Care Benefits (Box10)", 0.0)
+                vals2 = [gross, taxable_after, payroll_taxes, retirement]
+                ax2.bar(labels2, vals2)
+                ax2.set_ylabel("Amount ($)")
+                ax2.set_title("Income Allocation")
+                st.pyplot(fig2)
 
-    st.subheader("ðŸ“¥ Export-ready CSV (standard schema)")
-    st.dataframe(final, use_container_width=True)
+                # Marginal bracket visualization
+                fig3, ax3 = plt.subplots()
+                brackets = IRS_BRACKETS.get(tax_year, IRS_BRACKETS[2024])
+                xs = []
+                ys = []
+                for lower, upper, rate in brackets:
+                    xs.append(lower)
+                    ys.append(rate)
+                    xs.append(upper if upper != float("inf") else (lower * 1.5 + 10000))
+                    ys.append(rate)
+                ax3.step(xs, ys, where='post')
+                ax3.set_xlabel("Taxable Income")
+                ax3.set_ylabel("Marginal Rate")
+                ax3.set_title(f"Marginal Brackets ({tax_year})")
+                st.pyplot(fig3)
 
-    # Export with per-column formatting: round monetary values to 2 decimals
-    # but keep tax-rate columns with higher precision (4 decimals) so 0.062 and 0.0145 are preserved.
-    try:
-        export_df = final.copy()
-        num_cols = export_df.select_dtypes(include=["number"]).columns.tolist()
-        # round monetary/numeric columns to 2 decimals by default
-        if num_cols:
-            export_df.loc[:, num_cols] = export_df.loc[:, num_cols].round(2)
-        # keep tax rate precision
-        rate_cols = ["social_security_tax_rate", "medicare_tax_rate"]
-        # Format rate columns as strings with up to 4 decimal places but trim trailing zeros
-        for rc in rate_cols:
-            if rc in export_df.columns:
-                try:
-                    export_df[rc] = export_df[rc].apply(lambda v: ("{:.4f}".format(v)).rstrip('0').rstrip('.') if pd.notnull(v) else "")
-                except Exception:
-                    # fallback to numeric rounding if apply fails
-                    export_df[rc] = export_df[rc].round(4)
-        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
-    except Exception:
-        # fallback to simple CSV if something goes wrong
-        csv_bytes = final.to_csv(index=False, float_format='%.2f').encode("utf-8")
-    st.download_button("Download standard CSV", data=csv_bytes, file_name="parsed_w2_standard.csv", mime="text/csv")
+    # Export: separate Info (original input fields) from Derived (computed fields)
+    st.header("Export: Info & Derived Results")
 
-    # Download CSV
-    # Export derived results with sensible rounding
-    try:
-        dr = df_result.copy()
-        num_cols = dr.select_dtypes(include=["number"]).columns.tolist()
-        if num_cols:
-            dr.loc[:, num_cols] = dr.loc[:, num_cols].round(2)
-        csv_out = dr.to_csv(index=False).encode("utf-8")
-    except Exception:
-        csv_out = df_result.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="ðŸ’¾ Download Derived Results",
-        data=csv_out,
-        file_name="derived_w2_taxinfo_2025.csv",
-        mime="text/csv",
-    )
+    info_df = pd.DataFrame(info_rows)
+    derived_df = pd.DataFrame(derived_rows)
 
-    st.success("âœ… Tax data successfully processed!")
+    # Flatten lists for CSV in derived
+    if "Detected Errors/Warnings" in derived_df.columns:
+        derived_df["Detected Errors/Warnings"] = derived_df["Detected Errors/Warnings"].apply(lambda x: "; ".join(x) if isinstance(x, list) else x)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Info (source/input fields)")
+        st.write(info_df.head(10))
+        info_csv = io.StringIO()
+        info_df.to_csv(info_csv, index=False)
+        st.download_button("Download Info CSV", info_csv.getvalue(), file_name="w2_info.csv", mime="text/csv")
+
+    with c2:
+        st.subheader("Derived (computed fields)")
+        st.write(derived_df.head(10))
+        derived_csv = io.StringIO()
+        derived_df.to_csv(derived_csv, index=False)
+        st.download_button("Download Derived CSV", derived_csv.getvalue(), file_name="derived_w2_fields.csv", mime="text/csv")
+
 else:
-    st.info("ðŸ‘† Upload a W-2 CSV to begin.")
+    st.info("Upload a CSV with headers matching your format (profile_id, year, employer_name, employer_id, employee_name, ssn, wages, taxable_wages, federal_income_tax_withheld, social_security_wages, social_security_tax_withheld, medicare_wages, medicare_tax_withheld, retirement_deferrals, dependent_care_benefits, state, state_wages, state_tax_withheld, local_wages, local_tax_withheld, locality_name).")
 
-
+# Footer
+st.markdown("---")
+st.markdown("Notes: Tax brackets and deduction defaults are for 2024. Use the tax-year selector to choose other years (2021-2025). Update bracket tables if you need official 2025 values.")

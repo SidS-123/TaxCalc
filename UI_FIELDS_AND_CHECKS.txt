@@ -1,0 +1,110 @@
+UI Fields and Checks — W-2 Dashboard (app.py)
+
+1) Info (input/source fields shown/exported)
+- profile_id
+- year
+- employer_name
+- employer_id
+- employee_name
+- ssn
+- wages
+- taxable_wages
+- state
+- locality_name
+- state_wages
+- state_tax_withheld
+- local_wages
+- local_tax_withheld
+
+2) Derived fields displayed in the UI (computed by W2DerivedCalculator.compute_all)
+- Employee (friendly name; `employee_name` or `profile_id`)
+- Annual Taxable Income (Box 1 / wages)
+- Taxable Wages (taxable_wages)
+- Total Gross Earnings (estimate)
+- Inferred Pretax Reductions
+- Social Security Tax Owed (expected)
+- Social Security Tax Withheld (Box 4)
+- SS Withheld - Expected (Box 4 minus expected)
+- SS Wage Cap
+- SS Wage Cap Exceeded (boolean)
+- Medicare Tax Owed (expected)
+- Medicare Tax Withheld (Box 6)
+- Medicare Withheld - Expected (Box 6 minus expected)
+- Additional Medicare Threshold (filing status)
+- Federal Tax Withheld (Box 2)
+- Total Payroll Taxes Withheld (Fed+SS+Med)
+- Federal Withholding Rate (Box2/Box1)
+- State Tax Withheld
+- Local Tax Withheld
+- Retirement Deferrals (reported)
+- Dependent Care Benefits (Box10)
+- Earned Income Metric (wages + imputed)
+- Detected Errors/Warnings (list form; flattened for CSV)
+- Taxable Income After Standard Deduction
+- Federal Tax (computed via brackets)
+- Federal Refund / (Balance Due)
+- Consistency Score (0-1)
+
+3) Checks and rules applied (how "overpay/underpay" and consistency checks are computed)
+- Negative value detection:
+  - Fields checked: `wages`, `taxable_wages`, `federal_withheld`, `ss_wages`, `ss_withheld`, `med_wages`, `med_withheld`.
+  - Any negative value appends an error: "Negative value detected in <field>: <value>".
+
+- Social Security (SS) check:
+  - Expected SS owed = `SS_RATE * min(ss_wages, SS_WAGE_CAP)`.
+  - If `abs(ss_withheld - ss_owed) > 1.0`, append an error: "SS withheld (...) differs from expected (...)".
+  - `SS Wage Cap Exceeded` is set to `ss_wages > SS_WAGE_CAP`.
+
+- Medicare check:
+  - Basic Medicare = `MEDICARE_RATE * med_wages`.
+  - Additional Medicare: if `med_wages > filing_threshold`, additional rate (`ADDITIONAL_MEDICARE_RATE`) applies to wages above threshold.
+  - Total Medicare owed = basic + additional.
+  - If `abs(med_withheld - med_total) > 1.0`, append an error: "Medicare withheld (...) differs from expected (...)".
+  - `Additional Medicare Threshold (filing status)` records the threshold used.
+
+- Box-rule (wages vs SS/Med wages):
+  - If not (`wages <= ss_wages` or `wages <= med_wages`) (with tiny epsilon), append: "Wages (Box1) exceed SS/Medicare wages (unusual)".
+
+- Federal tax computation and over/underpay checks:
+  - Uses `IRSFederalTaxCalculator` with the selected tax year and filing status.
+  - Computes `Taxable Income After Standard Deduction` and `Federal Tax (computed via brackets)`.
+  - `Federal Refund / (Balance Due)` = `federal_withheld - fed_tax` (positive means refund/implied over-withholding; negative means balance due/under-withholding).
+  - `Federal Withholding Rate (Box2/Box1)` = `federal_withheld / wages` (0 if wages is 0).
+
+- Payroll totals and rates:
+  - `Total Payroll Taxes Withheld (Fed+SS+Med)` = `federal_withheld + ss_withheld + med_withheld`.
+  - `Federal Withholding Rate (Box2/Box1)` as above.
+
+- Consistency Score (0-1):
+  - Start at 1.0; subtract `0.2 * min(number_of_errors, 4)` for up to 4 errors.
+  - Subtract 0.1 if `ss_wages > SS_WAGE_CAP`.
+  - Final score floored at 0.0.
+
+4) Charts & visualizations (which fields feed which charts)
+- Payroll pie chart: uses
+  - `Federal Tax Withheld (Box 2)`,
+  - `Social Security Tax Withheld (Box 4)`,
+  - `Medicare Tax Withheld (Box 6)`,
+  - `State Tax Withheld`,
+  - `Local Tax Withheld`.
+
+- Income allocation bar chart: uses
+  - `Total Gross Earnings (estimate)`,
+  - `Taxable Income After Standard Deduction`,
+  - `Total Payroll Taxes Withheld (Fed+SS+Med)`,
+  - `Retirement Deferrals (reported)` + `Dependent Care Benefits (Box10)`.
+
+- Marginal bracket visualization: draws step plot from `IRS_BRACKETS` for the selected `tax_year`.
+
+5) Export behavior
+- Two CSV downloads provided:
+  - `w2_info.csv` — contains the Info/input fields listed in section (1).
+  - `derived_w2_fields.csv` — contains all Derived fields from section (2); `Detected Errors/Warnings` is flattened to a string.
+- Numeric formatting: monetary/float fields are formatted when rendering; CSV writes raw numeric values (the UI applies rounding for display where appropriate).
+
+6) Notes / places to customize
+- `info_keys` controls which source fields are included in the Info CSV — you can add `employer_address`, `locality_code`, or other source columns if present in uploads.
+- Error thresholds (SS/Med difference tolerance, currently 1.0) and scoring logic are in `W2DerivedCalculator.compute_all` and can be tuned.
+
+
+Generated from `app.py` (W-2 Derived Fields Dashboard). If you want a different layout or additional checks (e.g., per-state withholding heuristics), tell me what to add and I'll update the txt and the code accordingly.

@@ -1,4 +1,0 @@
-year,employer_name,employer_id,employee_name,ssn,wages,taxable_wages,federal_income_tax_withheld,social_security_wages,social_security_tax_withheld,medicare_wages,medicare_tax_withheld,retirement_deferrals,dependent_care_benefits,state,state_wages,state_tax_withheld,local_wages,local_tax_withheld,locality_name,net_pay,social_security_tax_rate,medicare_tax_rate
-,,,Alice Johnson,,48000,48000,3600,48000,2976,48000,696.00,3200,0,,48000,1500,,,,40728.00,0.062,0.0145
-,,,Ben Williams,,87000,87000,9100,87000,5394,87000,1261.50,7800,2000,,87000,3200,,,,71244.50,0.062,0.0145
-,,,Carla Reyes,,132000,132000,18000,132000,8184,132000,1914.00,12000,0,,132000,5500,,,,103902.00,0.062,0.0145

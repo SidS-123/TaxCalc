@@ -1,0 +1,146 @@
+TaxCalc - Architecture Report
+================================
+
+Purpose
+-------
+TaxCalc is a small Python/Streamlit app and helper library for parsing W-2 data (CSV and PDF), deriving
+tax-relevant fields (federal, Social Security, Medicare checks), and exporting a standardized CSV schema
+for downstream processing.
+
+High-level responsibilities
+- Allow user to upload W-2 CSVs and W-2 PDFs
+- Extract structured values from PDFs using a hybrid pipeline (layout/text/regex + OCR fallback)
+- Normalize and map columns from arbitrary input files into a canonical schema
+- Compute derived tax checks (expected Social Security / Medicare tax, net pay estimate, etc.)
+- Present results in Streamlit UI and allow exporting a standardized CSV
+
+Repository layout (top-level)
+--------------------------------
+TaxCalc/ (repo root)
+  - app.py                     # Streamlit web UI, CSV/PDF upload, mapping, derived calculations, export
+  - w2_parser/                  # parser package (may exist in workspace)
+      - w2_pdf_parser.py        # core parsing pipeline: template, layout, regex, OCR fallback
+      - templates/              # JSON templates (relative bounding boxes) and guide images
+  - scripts/
+      - make_final_from_sample.py  # utility: map sample.csv into canonical CSV (for examples)
+      - generate_guide_overlay.py   # helper that can draw template boxes on page images
+  - sample.csv                  # example CSV used by scripts
+  - parsed_w2_standard_sample.csv # generated example output
+  - requirements.txt            # python deps
+  - .gitignore
+  - ARCHITECTURE.txt            # this file
+
+Core components and responsibilities
+------------------------------------
+- Streamlit UI (`app.py`):
+  - Handles file uploads (CSV or PDF) and displays a raw table
+  - Uses fuzzy header detection to map columns into known Box names
+  - Calls parser routines for PDFs, shows debug traces when requested
+  - Computes derived fields (Expected_SS_Tax, Medicare liability, net_pay, etc.)
+  - Sanitizes and formats export DataFrame and provides "Download standard CSV"
+
+- Parser (`w2_parser/w2_pdf_parser.py`):
+  - read/parse PDF text with pdfplumber
+  - layout search by bounding boxes for template-driven extraction
+  - regex search across page text for fallback
+  - OCR fallback (pdf2image => pytesseract) if text extraction misses values
+  - expose a `parse_pdf(...)` function that returns a structured dict or DataFrame
+
+- Templates (`w2_parser/templates/*.json`, `w2_guide.png`):
+  - define relative bounding boxes (fractions of width/height) for W-2 boxes
+  - enable cropping and per-box OCR/text extraction to increase accuracy
+
+Data flow
+---------
+1) User uploads CSV or PDF via Streamlit UI
+2) If CSV: load into pandas, normalize headers (strip BOMs/whitespace, lowercasing), fuzzy-find canonical columns
+3) If PDF: parser runs:
+   - pdfplumber extracts page text/word coordinates
+   - try template-based cropping + text token extraction for expected fields
+   - perform layout-based word-position search if template absent
+   - fallback: convert page to image (PyMuPDF or pdf2image) and run pytesseract for OCR
+4) Build `df_result` with parsed and derived fields
+5) Create `final` DataFrame in the canonical schema and sanitize values
+6) Present derived table in UI and offer CSV downloads (standard CSV & derived CSV)
+
+ASCII Architecture Diagram
+--------------------------
+User Browser
+    |
+    v
+[Streamlit app: app.py] <---+-- displays UI, accepts uploads, shows tables
+    |                      |
+    | calls parser         | computes derived fields
+    v                      v
+[w2_parser] -----------> [pandas DataFrame: df_result] ---> [final export DataFrame]
+   |        \                                   /
+   |         \--(OCR fallback: pdf2image/pytesseract)
+   v
+[PDF/text engines]
+  - pdfplumber (text + layout)
+  - PyMuPDF / pdf2image (page render to image)
+  - pytesseract (OCR for images)
+
+Folder Tree (visual)
+--------------------
+TaxCalc/
+├── app.py
+├── ARCHITECTURE.txt
+├── requirements.txt
+├── .gitignore
+├── parsed_w2_standard_sample.csv
+├── sample.csv
+├── scripts/
+│   ├── make_final_from_sample.py
+│   └── generate_guide_overlay.py
+└── w2_parser/
+    ├── w2_pdf_parser.py
+    └── templates/
+        ├── standard_w2_relative.json
+        └── w2_guide.png
+
+Design & Implementation Notes
+-----------------------------
+- Robustness: The app uses multiple fallbacks to avoid hard dependency on ImageMagick (use PyMuPDF first, fallback to pdf2image). It also lazy-imports optional dependencies and shows clear error messages if system-level utilities (Tesseract, poppler) are missing.
+
+- Sanitization: Dataframes are normalized (header cleanup, numeric coercion, None/"None" replacement). Export formatting uses per-column rounding to keep monetary values readable while preserving tax-rate precision.
+
+- Extensibility: The template-driven approach allows adding new form templates for different W-2 versions or employer-specific layouts. Templates are relative, so they work across page sizes.
+
+Dependencies / System Requirements
+---------------------------------
+- Python packages (in `requirements.txt`):
+  - streamlit, pandas, pdfplumber, PyMuPDF (fitz), pdf2image, pillow, pytesseract
+  - dev/test: pytest, reportlab
+
+- System/OS-level:
+  - Tesseract OCR (for pytesseract) — install via OS package manager or Windows installer
+  - Poppler (for pdf2image rendered on some systems) — platform-specific install
+
+Run & Test
+----------
+1) Create and activate venv (you already have `vencv`):
+   - powershell: `.\vencv\Scripts\Activate.ps1`
+2) Install requirements: `pip install -r requirements.txt`
+3) Run Streamlit UI:
+   - `python -m streamlit run app.py`
+4) Run sample generator:
+   - `python .\scripts\make_final_from_sample.py` (writes `parsed_w2_standard_sample.csv`)
+
+How to extend
+-------------
+- Add a new template: create a JSON with relative bounding boxes in `w2_parser/templates`, then update the template loader.
+- Improve token detection: tweak regex patterns in `app.py` mapping and parser token cleaners.
+- Add unit tests for parser outputs (create ground-truth PDF/text fixtures and assert parsed dict values).
+
+Known limitations and future work
+--------------------------------
+- OCR accuracy depends on source PDF quality and Tesseract configuration.
+- Some PDFs use unusual fonts or embedded text encodings; template calibration and manual mapping may be required.
+- The app currently fills missing numeric values with 0 for CSV export; you may prefer blanks or NaN depending on downstream consumers.
+
+Contact & Maintenance
+---------------------
+For feature requests or bugs: open an issue in the project's GitHub repository and include sample inputs and expected outputs.
+
+End of report
